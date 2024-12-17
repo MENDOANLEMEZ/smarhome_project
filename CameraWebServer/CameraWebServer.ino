@@ -2,8 +2,10 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <HTTPClient.h>
+#include "esp_wifi.h"
+#include "esp_system.h"
 
-const char *apiUrl = "http://192.168.1.100/smarthome/addcamera.php";
+const char *apiUrl = "http://192.168.1.13/smarthome/addcamera.php";
 
 //
 // WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
@@ -40,20 +42,12 @@ const char *apiUrl = "http://192.168.1.100/smarthome/addcamera.php";
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char *ssid = "MENDO4N";
-const char *password = "12345678";
+const char *ssid = "ICT_LAB";
+const char *password = "ICTLAB2023";
 
 void startCameraServer();
 void setupLedFlash(int pin);
 
-void onEspNowReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-  String message = String((char *)data);
-  Serial.printf("Received message: %s\n", message.c_str());
-
-  if (message == "TAKE_PHOTO") {
-    takePhotoAndSend();
-  }
-}
 
 void setupEspNow() {
   WiFi.mode(WIFI_STA);
@@ -65,7 +59,6 @@ void setupEspNow() {
   // esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
   esp_now_register_recv_cb(onEspNowReceive);
 }
-
 
 void takePhotoAndSend() {
   camera_fb_t *fb = esp_camera_fb_get();
@@ -88,6 +81,16 @@ void takePhotoAndSend() {
   http.end();
   esp_camera_fb_return(fb);
 }
+
+void onEspNowReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  String message = String((char *)data);
+  Serial.printf("Received message: %s\n", message.c_str());
+
+  if (message == "TAKE_PHOTO") {
+    takePhotoAndSend();
+  }
+}
+
 
 
 void setup() {
@@ -182,6 +185,8 @@ void setup() {
   setupLedFlash(LED_GPIO_NUM);
 #endif
 
+  uint8_t newMAC[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
+  esp_wifi_set_mac(WIFI_IF_STA, newMAC);
   WiFi.begin(ssid, password);
   WiFi.setSleep(false);
 
