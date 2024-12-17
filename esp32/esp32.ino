@@ -4,46 +4,51 @@
 #include <espnow.h>
 #include <DHTesp.h>
 #include <Servo.h>
+#include <MQ2.h>
+#include <time.h>
 
-#define FAN_PIN D1
-#define DHT_PIN D3
-#define MQ2_PIN D8
-#define PIR_SENSOR_PIN D6  // Pin for PIR sensor
-#define FLAME_SENSOR_PIN D4
-#define SERVO_PIN D5
+#define FAN_PIN D8
+#define DHT_PIN D1
+#define MQ2_PIN D4
+#define PIR_SENSOR_PIN D2
+#define FLAME_SENSOR_PIN D5
+#define SERVO_PIN D6
 #define FLAME_THRESHOLD 1000
-#define MAGNETIC_SENSOR_PIN D2
-#define BUZZER_PIN D7
+#define MAGNETIC_SENSOR_PIN D7
+#define BUZZER_PIN D3
 
 const char* NTP_SERVER = "pool.ntp.org";
-const long GMT_OFFSET_SEC = 25200; // Adjust for your timezone (GMT+7 for WIB is 25200 seconds)
+const long GMT_OFFSET_SEC = 25200;  // GMT+7
 const int DAYLIGHT_OFFSET_SEC = 0;
 
 const char* WIFI_SSID = "MENDO4N";
 const char* WIFI_PASS = "12345678";
-const String SERVER_NAME = "http://192.168.144.120/smarthome/";
-const char* MQTT_SERVER = "broker.hivemq.com";
+const String SERVER_NAME = "http://192.168.7.120/smarthome/";
+const char* MQTT_SERVER = "test.mosquitto.org";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 DHTesp dht;
 Servo servoMotor;
+MQ2 mq2(MQ2_PIN);
 
 long lastMsg = 0;
 char msg[100];
 float temperature, humidity;
 bool locked = true;
 String doorstat = "close";
-String lockerstat = "locked"; // Updated status variable
+String lockerstat = "locked";
+String fan_status = "off";
+int nilaiGas = 0;
+int batasGas = 1000;
 
-uint8_t esp32CamAddress[] = {0x4C, 0xEB, 0xD6, 0x1F, 0xA2, 0x7C}; // ESP32-CAM MAC address
-// Declare motionDetected variable
-
+uint8_t esp32CamAddress[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 
 void setup() {
   Serial.begin(9600);
   Serial.println("Hello, ESP8266!");
 
+  mq2.begin(); // Kalibrasi sensor MQ2
   dht.setup(DHT_PIN, DHTesp::DHT22);
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(MAGNETIC_SENSOR_PIN, INPUT);
@@ -73,20 +78,24 @@ void setup() {
 }
 
 void lockServo() {
-  servoMotor.write(0);  // Lock position
+  servoMotor.write(0);
   locked = true;
   lockerstat = "locked";
   Serial.println("Locker: Locked");
 }
 
 void unlockServo() {
-  servoMotor.write(90);  // Unlock position
+  servoMotor.write(90);
   locked = false;
   lockerstat = "unlocked";
   Serial.println("Locker: Unlocked");
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("pesan diterima [");
+  Serial.print(topic);
+  Serial.print("]");
+  
   String message;
   for (int i = 0; i < length; i++) {
     message += (char)payload[i];
@@ -94,42 +103,41 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
   if (String(topic) == "lockerStatus") {
     if (message == "lock") {
+      Serial.println("mengunci");
       lockServo();
     } else if (message == "unlock") {
+      Serial.println("membuka");
       unlockServo();
     }
   }
-
-  Serial.print("Message received [");
-  Serial.print(topic);
-  Serial.print("]: ");
-  Serial.println(message);
 }
 
 void reconnect() {
   while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
     if (client.connect("ESP8266Client")) {
-      Serial.println("connected");
       client.subscribe("lockerStatus");
       client.subscribe("temperature&humidity");
+      client.subscribe("mq2");
       client.subscribe("securityStatus");
+      Serial.println("connected");
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      delay(1000);
+      Serial.print("try again in 5 seconds");
+      delay(5000);
     }
   }
 }
 
-void sendData(int temp, int hum, String status, String lockerstat, String doorstat) {
+void sendData(int temp, int hum, int gas, String status, String lockerstat, String doorstat, String fan_status) {
   HTTPClient http;
-  String url = SERVER_NAME + "addhome.php?suhu=" + String(temp) + "&humid=" + String(hum) + "&security=" + status + "&locker=" + lockerstat + "&door=" + doorstat;
+  String url = SERVER_NAME + "addhome.php?suhu=" + String(temp) + "&humid=" + String(hum) +
+               "&gas=" + String(gas) + "&security=" + status + "&locker=" + lockerstat +
+               "&door=" + doorstat + "&fan=" + fan_status;
   Serial.println("URL: " + url);
 
-  WiFiClient client;
-  http.begin(client, url.c_str());
+  http.begin(espClient, url.c_str());
   int httpResponseCode = http.GET();
   if (httpResponseCode > 0) {
     Serial.print("HTTP Response Code: ");
@@ -145,114 +153,125 @@ void readDHT(float &temp, float &hum) {
   TempAndHumidity data = dht.getTempAndHumidity();
   temp = data.temperature;
   hum = data.humidity;
-  Serial.print("Temperature: ");
-  Serial.println(temp);
-  Serial.print("Humidity: ");
-  Serial.println(hum);
+
+  // Cetak ke Serial Monitor
+  // Serial.print("Temp: ");
+  // Serial.println(temp);
+  // Serial.print("Hum: ");
+  // Serial.println(hum);
 }
 
 bool detectGas() {
-  int gasValue = analogRead(MQ2_PIN);
-  Serial.println("Gas sensor value: " + String(gasValue));
-  if (gasValue > 300) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    return true;
-  } else {
-    digitalWrite(BUZZER_PIN, LOW);
-    return false;
+  float* gasValues = mq2.read(false);  // Membaca semua jenis gas
+  
+  if (gasValues == NULL) {  // Cek jika sensor gagal membaca
+    Serial.println("Error membaca MQ2 sensor!");
+    return false; 
   }
+
+  nilaiGas = gasValues[1];  // Ambil nilai CO atau sesuaikan kebutuhan
+
+  // Serial.print("Nilai Gas: ");
+  // Serial.println(nilaiGas);
+
+  if (nilaiGas > batasGas) {
+    // Serial.println("Gas terdeteksi!");
+    return true;  // Kembalikan true jika gas terdeteksi
+  }
+
+  return false;  // Jika nilai gas aman
 }
 
 bool detectFlame() {
-  int flameValue = analogRead(FLAME_SENSOR_PIN);
+  int flameValue = digitalRead(FLAME_SENSOR_PIN);  // Membaca nilai digital
   Serial.print("Flame sensor value: ");
   Serial.println(flameValue);
-  if (flameValue < FLAME_THRESHOLD) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    Serial.println("Fire detected!");
-    return true;
+
+  if (flameValue == LOW) {  // Api terdeteksi (LOW bisa disesuaikan)
+    Serial.println("Flame detected!");
+    digitalWrite(BUZZER_PIN, HIGH);  // Aktifkan buzzer
+    return true;  // Kembalikan true jika api terdeteksi
   } else {
-    digitalWrite(BUZZER_PIN, LOW);
-    return false;
+    digitalWrite(BUZZER_PIN, LOW);  // Matikan buzzer
+    return false;  // Tidak ada api
   }
 }
 
-bool detectmotion() {
- int sensorValue = digitalRead(PIR_SENSOR_PIN);
-  Serial.print("PIR sensor value: ");
-  Serial.println(sensorValue);  // Debug untuk melihat nilai sebenarnya
-  if (sensorValue == HIGH) {
-    Serial.println("Motion detected!");
-    String message = "TAKE_PHOTO";
-    esp_now_send(esp32CamAddress, (uint8_t *)message.c_str(), message.length());
-    delay(5000); // Hindari trigger berulang
-    return true;
-  } else {
-    return false;
-  }
 
+bool detectMotion() {
+  int sensorValue = digitalRead(PIR_SENSOR_PIN);
+  if (lockerstat == "locked"){
+    if (sensorValue == HIGH) {
+      String message = "TAKE_PHOTO";
+      esp_now_send(esp32CamAddress, (uint8_t *)message.c_str(), message.length());
+      return true;
+    }
+  }
+  return false;
 }
 
 void checkDoorStatus() {
   int magneticState = digitalRead(MAGNETIC_SENSOR_PIN);
-  if (magneticState == HIGH) {  // Door closed
-    doorstat = "close";
-  } else {  // Door open
-    doorstat = "open";
-    Serial.println("Door is open!");
+  doorstat = (magneticState == HIGH) ? "close" : "open";
+}
+
+void checktime() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    int currentHour = timeinfo.tm_hour;     // Jam saat ini (0-23)
+    int currentMinute = timeinfo.tm_min;   // Menit saat ini (0-59)
+    int currentSecond = timeinfo.tm_sec;   // Detik saat ini (0-59)
+
+    // Kirim data pada awal jam (menit dan detik = 0)
+    if (currentMinute == 0 && currentSecond == 0) {
+      sendData(temperature, humidity, nilaiGas, "safe", lockerstat, doorstat, fan_status);
+      Serial.print("Data sent at hour: ");
+      Serial.println(currentHour);
+      delay(1000);  // Hindari pengiriman berulang di detik yang sama
+    }
+  } else {
+    Serial.println("Failed to obtain time");
   }
 }
 
 void loop() {
-if (!client.connected()) {
-    Serial.println("MQTT disconnected, reconnecting...");
-    reconnect();  // Attempt to reconnect if disconnected
-} else {
-    client.loop();  // Only call loop if connected
-}
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
 
   readDHT(temperature, humidity);
 
   if (temperature >= 27) {
     digitalWrite(FAN_PIN, HIGH);
+    fan_status = "on";
   } else {
     digitalWrite(FAN_PIN, LOW);
+    fan_status = "off";
   }
 
-  checkDoorStatus();  // Check door status
+  checkDoorStatus();
 
   if (detectFlame()) {
-    sendData(temperature, humidity, "flame", lockerstat, doorstat);
     client.publish("securityStatus", "flame");
+    sendData(temperature, humidity, nilaiGas, "flame", lockerstat, doorstat, fan_status);
   } else if (detectGas()) {
-    sendData(temperature, humidity, "gas", lockerstat, doorstat);
     client.publish("securityStatus", "gas");
-  } else if (detectmotion()) {
-    sendData(temperature, humidity, "intruder", lockerstat, doorstat);
-    client.publish("securityStatus", "intruder");
+    // sendData(temperature, humidity, nilaiGas, "dangerGass", lockerstat, doorstat, fan_status);
+  } else if (detectMotion()) {
+    client.publish("securityStatus", "motion");
+    sendData(temperature, humidity, nilaiGas, "Intruder", lockerstat, doorstat, fan_status);
   }
-
+  checktime();
   long now = millis();
-  if (now - lastMsg > 5000) {
-    lastMsg = now;
-    snprintf(msg, 100, "Temp: %.2f, Humidity: %.2f", temperature, humidity);
-    Serial.print("Publishing message: ");
-    Serial.println(msg);
-    client.publish("temperature&humidity", msg);
+  if (now - lastMsg > 1000) {
+    char messegdht[50]; 
+    sprintf(messegdht, "Temp: %.2f Hum: %.2f", temperature, humidity); // Format suhu dan kelembapan dengan 2 desimal
+    client.publish("temperature&humidity", messegdht);
+    char gasValueStr[8]; 
+    sprintf(gasValueStr, "%d", nilaiGas);  
+    client.publish("mq2", gasValueStr);
   }
-
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    Serial.println("Failed to obtain time");
-    delay(1000);
-    return;
-  }
-
-  int currentMinute = timeinfo.tm_min;
-  int currentSecond = timeinfo.tm_sec;
-  if (currentMinute == 0 && currentSecond == 0) {
-    sendData(temperature, humidity, "safe", lockerstat, doorstat);
-  }
-
-  delay(1000);
+  delay(0);
 }
+
